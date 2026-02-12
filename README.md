@@ -90,6 +90,8 @@ export GIT_JIRA_PAT=your-personal-access-token
 | `GIT_JIRA_CACHE_TTL` | | 캐시 유지 시간(초) | `3600` |
 | `GIT_JIRA_TICKET_PATTERN` | | 티켓 ID 정규식 | `[A-Z]+-[0-9]+` |
 | `GIT_JIRA_PROMPT_COLOR` | | 표시 색상 | `cyan` |
+| `GIT_JIRA_BRANCH_PREFIX` | | `gjc` 브랜치 접두사 | `feature/` |
+| `GIT_JIRA_BASE_BRANCH` | | `gjc` 새 브랜치 기준 브랜치 | `develop` |
 
 > △ = Jira Server/DC면 `GIT_JIRA_PAT`, Jira Cloud면 `GIT_JIRA_EMAIL` + `GIT_JIRA_API_TOKEN` 필요
 
@@ -117,6 +119,25 @@ export GIT_JIRA_PAT=your-personal-access-token
 - `hotfix/PROJ-42-fix-login`
 
 `GIT_JIRA_TICKET_PATTERN`을 변경하여 커스텀 패턴도 지원 가능.
+
+## `gjc` - Jira 티켓 브랜치 체크아웃
+
+`gjc` 명령으로 Jira에서 자신에게 할당된 열린 티켓을 조회하고, 선택한 티켓의 브랜치를 체크아웃합니다.
+
+```bash
+gjc
+```
+
+**동작 흐름:**
+
+1. Jira API로 `assignee = currentUser() AND statusCategory != Done` 티켓 조회
+2. fzf로 티켓 선택 (fzf 없으면 번호 선택 fallback)
+3. 브랜치 체크아웃:
+   - 로컬에 `feature/PROJ-123` 있으면 → `git checkout`
+   - 리모트에 있으면 → `git checkout --track`
+   - 없으면 → `origin/develop`에서 새 브랜치 생성
+
+브랜치 접두사와 기준 브랜치는 `GIT_JIRA_BRANCH_PREFIX`, `GIT_JIRA_BASE_BRANCH`로 변경 가능.
 
 ## 캐시
 

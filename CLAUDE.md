@@ -24,6 +24,8 @@ README.md                  # 설치/사용법
 - `GIT_JIRA_CACHE_TTL` - 캐시 TTL (기본 3600초)
 - `GIT_JIRA_TICKET_PATTERN` - 티켓 ID 정규식 (기본 `[A-Z]+-[0-9]+`)
 - `GIT_JIRA_PROMPT_COLOR` - 표시 색상 (기본 cyan)
+- `GIT_JIRA_BRANCH_PREFIX` - gjc 브랜치 접두사 (기본 `feature/`)
+- `GIT_JIRA_BASE_BRANCH` - gjc 새 브랜치 기준 브랜치 (기본 `develop`)
 
 ## 설정 파일 위치 (우선순위)
 1. 환경변수 (이미 설정된 경우)
@@ -58,6 +60,22 @@ curl -s -H "Authorization: Bearer $GIT_JIRA_PAT" \
 - GitHub: gmkseta/git-jira-task
 - 변경 후 push → 사용자는 플러그인 디렉토리에서 `git pull`
 - `.env`는 `.gitignore`에 포함, 커밋 금지
+
+## gjc 동작 흐름
+1. `gjc` 실행 → git repo 확인 → Jira 설정 확인
+2. `_git_jira_search_issues()` → JQL `assignee=currentUser() AND statusCategory!=Done` 조회
+3. `_git_jira_parse_issues()` → JSON에서 key/summary/status 추출 (jq 없이 grep+sed)
+4. `_git_jira_select_ticket()` → fzf 선택 UI (없으면 zsh select fallback)
+5. `_git_jira_do_checkout()` → 로컬/리모트/신규 브랜치 분기 체크아웃
+
+## gjc 관련 함수
+- `_git_jira_curl()` - 인증 분기 공통 curl wrapper (`_git_jira_fetch_summary`도 사용)
+- `_git_jira_url_encode()` - JQL URL 인코딩 (pure zsh, RFC 3986)
+- `_git_jira_search_issues()` - `/rest/api/2/search` 호출
+- `_git_jira_parse_issues()` - JSON → key/summary/status 배열 추출
+- `_git_jira_select_ticket()` - fzf 선택 (fallback: zsh select)
+- `_git_jira_do_checkout()` - 브랜치 존재 여부 판단 후 checkout/create
+- `_git_jira_checkout()` - gjc 메인 오케스트레이터
 
 ## 주의사항
 - `precmd_functions` 빈 배열일 때 math expression 에러 주의 → `${+precmd_functions[(r)...]}` 사용

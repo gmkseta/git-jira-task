@@ -58,7 +58,7 @@ _git_jira_setup() {
   fi
 
   # 옵션 설정
-  local cache_ttl ticket_pattern prompt_color
+  local cache_ttl ticket_pattern prompt_color branch_prefix base_branch
   echo ""
   read "cache_ttl?캐시 TTL (초, 기본 3600): "
   : "${cache_ttl:=3600}"
@@ -66,6 +66,10 @@ _git_jira_setup() {
   : "${ticket_pattern:=[A-Z]+-[0-9]+}"
   read "prompt_color?프롬프트 색상 (기본 cyan): "
   : "${prompt_color:=cyan}"
+  read "branch_prefix?브랜치 접두사 (기본 feature/): "
+  : "${branch_prefix:=feature/}"
+  read "base_branch?기본 브랜치 (기본 develop): "
+  : "${base_branch:=develop}"
 
   # 저장 위치 선택
   local save_location
@@ -105,6 +109,8 @@ EOF
 GIT_JIRA_CACHE_TTL=${cache_ttl}
 GIT_JIRA_TICKET_PATTERN='${ticket_pattern}'
 GIT_JIRA_PROMPT_COLOR=${prompt_color}
+GIT_JIRA_BRANCH_PREFIX=${branch_prefix}
+GIT_JIRA_BASE_BRANCH=${base_branch}
 EOF
 
   chmod 600 "$env_path"
@@ -161,12 +167,15 @@ fi
 
 # 사용자 명령으로 노출
 alias git-jira-setup='_git_jira_setup'
+alias gjc='_git_jira_checkout'
 
 # ---------- 기본값 ----------
 
 : "${GIT_JIRA_CACHE_TTL:=3600}"
 : "${GIT_JIRA_TICKET_PATTERN:=[A-Z]+-[0-9]+}"
 : "${GIT_JIRA_PROMPT_COLOR:=cyan}"
+: "${GIT_JIRA_BRANCH_PREFIX:=feature/}"
+: "${GIT_JIRA_BASE_BRANCH:=develop}"
 
 typeset -g _GIT_JIRA_CACHE_DIR="$HOME/.cache/git-jira-task"
 typeset -g _GIT_JIRA_LAST_TICKET=""
@@ -176,29 +185,35 @@ typeset -g _GIT_JIRA_LAST_SUMMARY=""
 
 # ---------- Jira API ----------
 
-_git_jira_fetch_summary() {
-  local ticket_id="$1"
-  local url="${GIT_JIRA_BASE_URL}/rest/api/2/issue/${ticket_id}?fields=summary"
-  local response=""
+# 인증 분기 공통 curl wrapper
+_git_jira_curl() {
+  local url="$1"
 
   if [[ -n "$GIT_JIRA_EMAIL" && -n "$GIT_JIRA_API_TOKEN" ]]; then
     # Jira Cloud: Basic auth
     local cred
     cred=$(printf '%s:%s' "$GIT_JIRA_EMAIL" "$GIT_JIRA_API_TOKEN" | base64)
-    response=$(curl -sf --max-time 5 \
+    curl -sf --max-time 10 \
       -H "Authorization: Basic $cred" \
       -H "Content-Type: application/json" \
-      "$url" 2>/dev/null)
+      "$url" 2>/dev/null
   elif [[ -n "$GIT_JIRA_PAT" ]]; then
     # Jira Server/DC: Bearer token
-    response=$(curl -sf --max-time 5 \
+    curl -sf --max-time 10 \
       -H "Authorization: Bearer $GIT_JIRA_PAT" \
       -H "Content-Type: application/json" \
-      "$url" 2>/dev/null)
+      "$url" 2>/dev/null
   else
     return 1
   fi
+}
 
+_git_jira_fetch_summary() {
+  local ticket_id="$1"
+  local url="${GIT_JIRA_BASE_URL}/rest/api/2/issue/${ticket_id}?fields=summary"
+  local response
+
+  response=$(_git_jira_curl "$url") || return 1
   [[ -z "$response" ]] && return 1
 
   # JSON에서 summary 추출 (jq 의존성 없이)
@@ -209,6 +224,191 @@ _git_jira_fetch_summary() {
   [[ -z "$summary" ]] && return 1
 
   printf '%s' "$summary"
+}
+
+# ---------- gjc: Jira 티켓 선택 → 브랜치 체크아웃 ----------
+
+# JQL URL 인코딩 (pure zsh, RFC 3986)
+_git_jira_url_encode() {
+  local input="$1"
+  local encoded=""
+  local i c o
+  for (( i=1; i<=${#input}; i++ )); do
+    c="${input[$i]}"
+    case "$c" in
+      [A-Za-z0-9._~-]) encoded+="$c" ;;
+      *) o=$(printf '%%%02X' "'$c") ; encoded+="$o" ;;
+    esac
+  done
+  printf '%s' "$encoded"
+}
+
+# Jira 검색 API 호출
+_git_jira_search_issues() {
+  local jql="assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC"
+  local encoded_jql
+  encoded_jql=$(_git_jira_url_encode "$jql")
+  local url="${GIT_JIRA_BASE_URL}/rest/api/2/search?jql=${encoded_jql}&fields=summary,status&maxResults=50"
+  _git_jira_curl "$url"
+}
+
+# JSON에서 key/summary/status 추출 (jq 없이)
+_git_jira_parse_issues() {
+  local json="$1"
+
+  # issues 배열이 비어있는지 확인
+  if printf '%s' "$json" | grep -q '"issues":\[\]'; then
+    return 1
+  fi
+
+  # 각 이슈를 개별 줄로 분리하여 파싱
+  # 이슈 객체를 하나씩 분리
+  local issues_part
+  issues_part=$(printf '%s' "$json" | sed 's/.*"issues":\[//;s/\].*$//')
+
+  # 각 이슈 블록에서 key, summary, status name 추출
+  local key summary status_name
+  local count=0
+
+  # key 추출: "key":"PROJ-123" 패턴
+  local -a keys summaries statuses
+  keys=("${(@f)$(printf '%s' "$issues_part" | grep -oE '"key":"[A-Z]+-[0-9]+"' | sed 's/"key":"//;s/"//')}")
+  summaries=("${(@f)$(printf '%s' "$issues_part" | grep -oE '"summary":"[^"]*"' | sed 's/"summary":"//;s/"$//')}")
+  statuses=("${(@f)$(printf '%s' "$issues_part" | grep -oE '"status":\{[^}]*"name":"[^"]*"' | sed 's/.*"name":"//;s/"$//')}")
+
+  [[ ${#keys[@]} -eq 0 ]] && return 1
+
+  local i
+  for (( i=1; i<=${#keys[@]}; i++ )); do
+    [[ -z "${keys[$i]}" ]] && continue
+    local s="${statuses[$i]:-}"
+    local sm="${summaries[$i]:-}"
+    printf '%s\t[%s] %s\n' "${keys[$i]}" "$s" "$sm"
+  done
+}
+
+# fzf 선택 UI (fallback: zsh select)
+_git_jira_select_ticket() {
+  local -a lines
+  lines=("${(@f)$(cat)}")
+
+  [[ ${#lines[@]} -eq 0 ]] && return 1
+
+  if command -v fzf &>/dev/null; then
+    local selected
+    selected=$(printf '%s\n' "${lines[@]}" | \
+      fzf --height=~40% --reverse --no-sort \
+          --prompt="티켓 선택> " \
+          --header="ESC: 취소" \
+          --delimiter=$'\t' \
+          --with-nth=1.. \
+          --preview-window=hidden)
+    [[ -z "$selected" ]] && return 1
+    printf '%s' "$selected" | cut -f1
+  else
+    # zsh select fallback
+    echo ""
+    echo "=== 할당된 티켓 ==="
+    local i
+    for (( i=1; i<=${#lines[@]}; i++ )); do
+      printf '  %d) %s\n' "$i" "${lines[$i]}"
+    done
+    echo "  0) 취소"
+    echo ""
+
+    local choice
+    read "choice?선택 [0-${#lines[@]}]: "
+
+    [[ -z "$choice" || "$choice" == "0" ]] && return 1
+    if (( choice < 1 || choice > ${#lines[@]} )); then
+      echo "잘못된 선택입니다." >&2
+      return 1
+    fi
+
+    printf '%s' "${lines[$choice]}" | cut -f1
+  fi
+}
+
+# 브랜치 존재 여부 확인 후 checkout/create
+_git_jira_do_checkout() {
+  local ticket_id="$1"
+  local branch="${GIT_JIRA_BRANCH_PREFIX}${ticket_id}"
+
+  # 1) 로컬 브랜치 존재
+  if git show-ref --verify --quiet "refs/heads/${branch}" 2>/dev/null; then
+    echo "로컬 브랜치로 체크아웃: ${branch}"
+    git checkout "$branch"
+    return $?
+  fi
+
+  # 2) 리모트 브랜치 존재 확인 (fetch 후)
+  git fetch --prune --quiet 2>/dev/null
+  if git show-ref --verify --quiet "refs/remotes/origin/${branch}" 2>/dev/null; then
+    echo "리모트 브랜치를 추적하여 체크아웃: ${branch}"
+    git checkout -b "$branch" --track "origin/${branch}"
+    return $?
+  fi
+
+  # 3) base branch에서 새 브랜치 생성
+  local base_branch="${GIT_JIRA_BASE_BRANCH}"
+  if git show-ref --verify --quiet "refs/remotes/origin/${base_branch}" 2>/dev/null; then
+    git fetch origin "$base_branch" --quiet 2>/dev/null
+    echo "origin/${base_branch}에서 새 브랜치 생성: ${branch}"
+    git checkout -b "$branch" "origin/${base_branch}"
+    return $?
+  fi
+
+  # 4) base branch도 없으면 현재 HEAD에서 생성
+  echo "⚠ origin/${base_branch}를 찾을 수 없어 현재 HEAD에서 생성합니다: ${branch}"
+  git checkout -b "$branch"
+  return $?
+}
+
+# gjc 메인 진입점
+_git_jira_checkout() {
+  # git repo 확인
+  if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+    echo "Git 리포지토리가 아닙니다." >&2
+    return 1
+  fi
+
+  # Jira 설정 확인
+  if [[ -z "$GIT_JIRA_BASE_URL" ]]; then
+    echo "Jira 설정이 없습니다. 'git-jira-setup'으로 설정하세요." >&2
+    return 1
+  fi
+
+  if [[ -z "$GIT_JIRA_PAT" && ( -z "$GIT_JIRA_EMAIL" || -z "$GIT_JIRA_API_TOKEN" ) ]]; then
+    echo "Jira 인증 정보가 없습니다. 'git-jira-setup'으로 설정하세요." >&2
+    return 1
+  fi
+
+  # Jira API 호출
+  echo "할당된 티켓을 조회하는 중..."
+  local response
+  response=$(_git_jira_search_issues)
+  if [[ $? -ne 0 || -z "$response" ]]; then
+    echo "Jira API 호출에 실패했습니다." >&2
+    return 1
+  fi
+
+  # 이슈 파싱
+  local parsed
+  parsed=$(_git_jira_parse_issues "$response")
+  if [[ $? -ne 0 || -z "$parsed" ]]; then
+    echo "할당된 열린 티켓이 없습니다."
+    return 0
+  fi
+
+  # 티켓 선택
+  local ticket_id
+  ticket_id=$(printf '%s\n' "$parsed" | _git_jira_select_ticket)
+  if [[ $? -ne 0 || -z "$ticket_id" ]]; then
+    return 0
+  fi
+
+  # 브랜치 체크아웃
+  _git_jira_do_checkout "$ticket_id"
 }
 
 # ---------- 캐시 ----------
